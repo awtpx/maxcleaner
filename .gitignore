@@ -1,0 +1,9 @@
+# Build objects
+*.o
+*.obj
+
+# Temporary files
+*.tmp
+*.log
+.vscode/
+.idea/
