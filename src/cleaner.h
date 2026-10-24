@@ -25,9 +25,9 @@ typedef struct {
     bool autoCleanEnabled;        // Default: true
     bool blockerEnabled;          // Default: true
     bool cleanRecycleBin;         // Default: true
-    bool cleanBrowserCaches;      // Default: true
+    bool cleanBrowserCaches;      // Default: true (Active running apps are strictly preserved)
     bool cleanCrashDumps;         // Default: true
-    int minFileAgeSeconds;        // Default: 60
+    int minFileAgeSeconds;        // Default: 14400 (4 hours - prevents deleting active app temp files)
     wchar_t blockedProcesses[MAX_BLOCKED_PROCESSES][64];
     int blockedCount;
 } CleanerConfig;
@@ -40,6 +40,9 @@ void Cleaner_Init(void);
 
 // Run a cleaning sweep asynchronously on a background thread
 void Cleaner_RunSweepAsync(HWND hwndNotify, bool bManual);
+
+// Check if a process is currently running by executable name
+bool Cleaner_IsProcessRunning(const wchar_t *processExeName);
 
 // Block unnecessary/bloat background applications
 uint32_t Cleaner_BlockUnnecessaryApps(void);

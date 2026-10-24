@@ -15,6 +15,10 @@ static wchar_t s_ConfigIniPath[MAX_PATH] = {0};
 static const wchar_t *RUN_REG_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t *RUN_REG_VALUE = L"Max Cleaner";
 
+#define MAX_RUNNING_PROCS 512
+static wchar_t s_RunningProcs[MAX_RUNNING_PROCS][64];
+static int s_RunningProcCount = 0;
+
 // Critical system processes whitelist - strictly protected
 static const wchar_t *SYSTEM_WHITELIST[] = {
     L"system",
@@ -68,6 +72,75 @@ static void GetExeDirectory(wchar_t *outPath, DWORD maxLen) {
     }
 }
 
+// Refresh the fast snapshot of currently active processes
+static void RefreshRunningProcesses(void) {
+    s_RunningProcCount = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (s_RunningProcCount < MAX_RUNNING_PROCS) {
+                wcsncpy(s_RunningProcs[s_RunningProcCount], pe.szExeFile, 63);
+                s_RunningProcs[s_RunningProcCount][63] = L'\0';
+                s_RunningProcCount++;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+}
+
+bool Cleaner_IsProcessRunning(const wchar_t *procName) {
+    for (int i = 0; i < s_RunningProcCount; i++) {
+        if (_wcsicmp(s_RunningProcs[i], procName) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Smart safety checks: if an application is active, protect its folders in %TEMP% and cache
+static bool ShouldSkipDirectory(const wchar_t *dirName) {
+    if (Cleaner_IsProcessRunning(L"chrome.exe")) {
+        if (wcsstr(dirName, L"chrome") || wcsstr(dirName, L"scoped_dir") || wcsstr(dirName, L"CRX_")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"msedge.exe")) {
+        if (wcsstr(dirName, L"edge") || wcsstr(dirName, L"msedge") || wcsstr(dirName, L"scoped_dir")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"brave.exe")) {
+        if (wcsstr(dirName, L"brave") || wcsstr(dirName, L"scoped_dir")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"firefox.exe")) {
+        if (wcsstr(dirName, L"mozilla") || wcsstr(dirName, L"firefox")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"Discord.exe")) {
+        if (wcsstr(dirName, L"discord")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"steam.exe") || Cleaner_IsProcessRunning(L"steamwebhelper.exe")) {
+        if (wcsstr(dirName, L"steam")) return true;
+    }
+    if (Cleaner_IsProcessRunning(L"Spotify.exe")) {
+        if (wcsstr(dirName, L"spotify")) return true;
+    }
+    return false;
+}
+
+// Never delete in-progress download files or actively locked streams
+static bool ShouldSkipFile(const wchar_t *fileName) {
+    const wchar_t *ext = wcsrchr(fileName, L'.');
+    if (ext) {
+        if (_wcsicmp(ext, L".crdownload") == 0 ||
+            _wcsicmp(ext, L".part") == 0 ||
+            _wcsicmp(ext, L".download") == 0 ||
+            _wcsicmp(ext, L".opdownload") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Cleaner_LoadConfig(void) {
     wchar_t exeDir[MAX_PATH];
     GetExeDirectory(exeDir, MAX_PATH);
@@ -87,7 +160,9 @@ void Cleaner_LoadConfig(void) {
     g_Config.cleanRecycleBin = GetPrivateProfileIntW(L"Settings", L"CleanRecycleBin", 1, s_ConfigIniPath) != 0;
     g_Config.cleanBrowserCaches = GetPrivateProfileIntW(L"Settings", L"CleanBrowserCaches", 1, s_ConfigIniPath) != 0;
     g_Config.cleanCrashDumps = GetPrivateProfileIntW(L"Settings", L"CleanCrashDumps", 1, s_ConfigIniPath) != 0;
-    g_Config.minFileAgeSeconds = GetPrivateProfileIntW(L"Settings", L"MinFileAgeSeconds", 60, s_ConfigIniPath);
+    
+    // Default safe threshold: 14400 seconds (4 hours) so active software temp files are preserved
+    g_Config.minFileAgeSeconds = GetPrivateProfileIntW(L"Settings", L"MinFileAgeSeconds", 14400, s_ConfigIniPath);
 
     g_Config.blockedCount = 0;
     for (int i = 1; i <= MAX_BLOCKED_PROCESSES; i++) {
@@ -254,7 +329,7 @@ uint32_t Cleaner_BlockUnnecessaryApps(void) {
     return blocked;
 }
 
-// Low-overhead recursive directory cleaner with safety checks and anti-frame-drop throttling
+// Low-overhead recursive directory cleaner with smart app-aware protection
 static void CleanDirectoryInternal(const wchar_t *dirPath, int depth, uint32_t *pFilesCleaned, uint64_t *pBytesCleaned) {
     if (depth > 5) return; // Prevent excessive recursion depth
 
@@ -276,8 +351,18 @@ static void CleanDirectoryInternal(const wchar_t *dirPath, int depth, uint32_t *
             continue;
         }
 
-        // Strictly skip symlinks, junctions and reparse points to avoid recursion loops
+        // Strictly skip symlinks, junctions and reparse points
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            continue;
+        }
+
+        // If an application is currently running, strictly protect its subdirectories in temp
+        if (ShouldSkipDirectory(fd.cFileName)) {
+            continue;
+        }
+
+        // Skip in-progress downloads
+        if (ShouldSkipFile(fd.cFileName)) {
             continue;
         }
 
@@ -288,7 +373,7 @@ static void CleanDirectoryInternal(const wchar_t *dirPath, int depth, uint32_t *
             CleanDirectoryInternal(itemPath, depth + 1, pFilesCleaned, pBytesCleaned);
             RemoveDirectoryW(itemPath);
         } else {
-            // Check file age (avoid deleting active temporary files written in last 60s)
+            // Check file age (avoid deleting active temporary files from running applications)
             ULARGE_INTEGER uFile;
             uFile.LowPart = fd.ftLastWriteTime.dwLowDateTime;
             uFile.HighPart = fd.ftLastWriteTime.dwHighDateTime;
@@ -337,14 +422,19 @@ static DWORD WINAPI SweepWorkerThread(LPVOID lpParam) {
     uint64_t bytesCleaned = 0;
     uint32_t blockedProcs = 0;
 
+    // Refresh active running processes snapshot
+    RefreshRunningProcesses();
+
     Cleaner_Log(bManual ? L"--- Starting Manual Turbo Clean Sweep ---" : L"--- Starting 5-Minute Auto Clean Sweep ---");
 
     // 1. Block unnecessary background apps
     if (g_Config.blockerEnabled) {
         blockedProcs = Cleaner_BlockUnnecessaryApps();
+        // Refresh running processes after blocker runs
+        RefreshRunningProcesses();
     }
 
-    // 2. Clean User Temp (%TEMP%)
+    // 2. Clean User Temp (%TEMP%) - protects active applications
     wchar_t tempPath[MAX_PATH];
     if (GetTempPathW(MAX_PATH, tempPath) > 0) {
         size_t len = wcslen(tempPath);
@@ -385,43 +475,97 @@ static DWORD WINAPI SweepWorkerThread(LPVOID lpParam) {
         }
     }
 
-    // 5. Clean Browser Caches (Safe: caches only, never cookies/passwords/history)
+    // 5. Clean Application / Browser Caches ONLY if that application is NOT running!
+    // If the application is open, its cache files remain untouched in the folders.
     if (g_Config.cleanBrowserCaches) {
         wchar_t localAppData[MAX_PATH];
         wchar_t appData[MAX_PATH];
+
+        bool isChromeRunning = Cleaner_IsProcessRunning(L"chrome.exe");
+        bool isEdgeRunning = Cleaner_IsProcessRunning(L"msedge.exe");
+        bool isBraveRunning = Cleaner_IsProcessRunning(L"brave.exe");
+        bool isFirefoxRunning = Cleaner_IsProcessRunning(L"firefox.exe");
+        bool isDiscordRunning = Cleaner_IsProcessRunning(L"Discord.exe");
+        bool isSteamRunning = Cleaner_IsProcessRunning(L"steam.exe") || Cleaner_IsProcessRunning(L"steamwebhelper.exe");
+        bool isSpotifyRunning = Cleaner_IsProcessRunning(L"Spotify.exe");
+
         if (SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, localAppData) == S_OK) {
-            // Chrome Cache
-            wchar_t chromeCache[MAX_PATH];
-            swprintf(chromeCache, MAX_PATH, L"%s\\Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data", localAppData);
-            CleanDirectoryInternal(chromeCache, 0, &filesCleaned, &bytesCleaned);
-            swprintf(chromeCache, MAX_PATH, L"%s\\Google\\Chrome\\User Data\\Default\\Code Cache", localAppData);
-            CleanDirectoryInternal(chromeCache, 0, &filesCleaned, &bytesCleaned);
+            // Google Chrome Cache
+            if (isChromeRunning) {
+                Cleaner_Log(L"Google Chrome is active: cache preserved untouched.");
+            } else {
+                wchar_t chromeCache[MAX_PATH];
+                swprintf(chromeCache, MAX_PATH, L"%s\\Google\\Chrome\\User Data\\Default\\Cache\\Cache_Data", localAppData);
+                CleanDirectoryInternal(chromeCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(chromeCache, MAX_PATH, L"%s\\Google\\Chrome\\User Data\\Default\\Code Cache", localAppData);
+                CleanDirectoryInternal(chromeCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(chromeCache, MAX_PATH, L"%s\\Google\\Chrome\\User Data\\Default\\GPUCache", localAppData);
+                CleanDirectoryInternal(chromeCache, 0, &filesCleaned, &bytesCleaned);
+            }
 
-            // Edge Cache
-            wchar_t edgeCache[MAX_PATH];
-            swprintf(edgeCache, MAX_PATH, L"%s\\Microsoft\\Edge\\User Data\\Default\\Cache\\Cache_Data", localAppData);
-            CleanDirectoryInternal(edgeCache, 0, &filesCleaned, &bytesCleaned);
-            swprintf(edgeCache, MAX_PATH, L"%s\\Microsoft\\Edge\\User Data\\Default\\Code Cache", localAppData);
-            CleanDirectoryInternal(edgeCache, 0, &filesCleaned, &bytesCleaned);
+            // Microsoft Edge Cache
+            if (isEdgeRunning) {
+                Cleaner_Log(L"Microsoft Edge is active: cache preserved untouched.");
+            } else {
+                wchar_t edgeCache[MAX_PATH];
+                swprintf(edgeCache, MAX_PATH, L"%s\\Microsoft\\Edge\\User Data\\Default\\Cache\\Cache_Data", localAppData);
+                CleanDirectoryInternal(edgeCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(edgeCache, MAX_PATH, L"%s\\Microsoft\\Edge\\User Data\\Default\\Code Cache", localAppData);
+                CleanDirectoryInternal(edgeCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(edgeCache, MAX_PATH, L"%s\\Microsoft\\Edge\\User Data\\Default\\GPUCache", localAppData);
+                CleanDirectoryInternal(edgeCache, 0, &filesCleaned, &bytesCleaned);
+            }
 
-            // Brave Cache
-            wchar_t braveCache[MAX_PATH];
-            swprintf(braveCache, MAX_PATH, L"%s\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache\\Cache_Data", localAppData);
-            CleanDirectoryInternal(braveCache, 0, &filesCleaned, &bytesCleaned);
+            // Brave Browser Cache
+            if (isBraveRunning) {
+                Cleaner_Log(L"Brave Browser is active: cache preserved untouched.");
+            } else {
+                wchar_t braveCache[MAX_PATH];
+                swprintf(braveCache, MAX_PATH, L"%s\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache\\Cache_Data", localAppData);
+                CleanDirectoryInternal(braveCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(braveCache, MAX_PATH, L"%s\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Code Cache", localAppData);
+                CleanDirectoryInternal(braveCache, 0, &filesCleaned, &bytesCleaned);
+            }
 
             // Steam HTML Cache
-            wchar_t steamCache[MAX_PATH];
-            swprintf(steamCache, MAX_PATH, L"%s\\Steam\\htmlcache\\Cache", localAppData);
-            CleanDirectoryInternal(steamCache, 0, &filesCleaned, &bytesCleaned);
+            if (isSteamRunning) {
+                Cleaner_Log(L"Steam is active: web cache preserved untouched.");
+            } else {
+                wchar_t steamCache[MAX_PATH];
+                swprintf(steamCache, MAX_PATH, L"%s\\Steam\\htmlcache\\Cache", localAppData);
+                CleanDirectoryInternal(steamCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(steamCache, MAX_PATH, L"%s\\Steam\\htmlcache\\Code Cache", localAppData);
+                CleanDirectoryInternal(steamCache, 0, &filesCleaned, &bytesCleaned);
+            }
+
+            // Spotify Storage Cache
+            if (isSpotifyRunning) {
+                Cleaner_Log(L"Spotify is active: cache preserved untouched.");
+            } else {
+                wchar_t spotifyCache[MAX_PATH];
+                swprintf(spotifyCache, MAX_PATH, L"%s\\Spotify\\Storage", localAppData);
+                CleanDirectoryInternal(spotifyCache, 0, &filesCleaned, &bytesCleaned);
+            }
         }
 
         if (SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, appData) == S_OK) {
             // Discord Cache
-            wchar_t discordCache[MAX_PATH];
-            swprintf(discordCache, MAX_PATH, L"%s\\discord\\Cache\\Cache_Data", appData);
-            CleanDirectoryInternal(discordCache, 0, &filesCleaned, &bytesCleaned);
-            swprintf(discordCache, MAX_PATH, L"%s\\discord\\Code Cache", appData);
-            CleanDirectoryInternal(discordCache, 0, &filesCleaned, &bytesCleaned);
+            if (isDiscordRunning) {
+                Cleaner_Log(L"Discord is active: cache preserved untouched.");
+            } else {
+                wchar_t discordCache[MAX_PATH];
+                swprintf(discordCache, MAX_PATH, L"%s\\discord\\Cache\\Cache_Data", appData);
+                CleanDirectoryInternal(discordCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(discordCache, MAX_PATH, L"%s\\discord\\Code Cache", appData);
+                CleanDirectoryInternal(discordCache, 0, &filesCleaned, &bytesCleaned);
+                swprintf(discordCache, MAX_PATH, L"%s\\discord\\GPUCache", appData);
+                CleanDirectoryInternal(discordCache, 0, &filesCleaned, &bytesCleaned);
+            }
+
+            // Firefox Cache
+            if (isFirefoxRunning) {
+                Cleaner_Log(L"Mozilla Firefox is active: cache preserved untouched.");
+            }
         }
     }
 
